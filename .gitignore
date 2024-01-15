@@ -1,0 +1,6 @@
+running*.sh
+./.idea/
+ssl_train.json
+./venv/
+slurm*.out
+slurm*.stats
