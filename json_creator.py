@@ -17,6 +17,7 @@ def create_json(path):
         dataset_dict[dataset] = []
         dataset_path = os.path.join(path, dataset)
         images_path = os.path.join(dataset_path, 'images')
+        if not os.path.exists(images_path): continue
         for image in os.listdir(images_path):
             image_path = os.path.join(images_path, image)
             dataset_dict[dataset].append({'image':image_path})
