@@ -162,13 +162,13 @@ class Cls_Patch_Loss(nn.Module):
         """
 
         cls_center = torch.sum(teacher_cls, dim=0, keepdim=True)
-        #dist.all_reduce(cls_center)
+        dist.all_reduce(cls_center)
         cls_center = cls_center / (len(teacher_cls)) 
         self.center = self.center * self.center_momentum + cls_center * (1 - self.center_momentum)
         #self.center = self.center * self.center_momentum + cls_center * (1 - self.center_momentum)
 
         patch_center = torch.sum(teacher_patch.mean(1), dim=0, keepdim=True)
-        #dist.all_reduce(patch_center)
+        dist.all_reduce(patch_center)
         patch_center = patch_center / (len(teacher_patch) )
         #patch_center = patch_center / (len(teacher_patch) * dist.get_world_size())
         self.center2 = self.center2 * self.center_momentum2 + patch_center * (1 - self.center_momentum2)
@@ -436,10 +436,10 @@ def main_worker(gpu,args):
     if lrschedule == 'warmup_cosine':
         scheduler = LinearWarmupCosineAnnealingLR(optimizer,
                                                   warmup_epochs=20,
-                                                  max_epochs=500)
+                                                  max_epochs=ars_epochs)
     if lrschedule == 'cosine_anneal':
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer,
-                                                               T_max=500)
+                                                               T_max=ars_epochs)
 
     train_ds = data.CacheDataset(
                     data=train_Data,
