@@ -154,19 +154,21 @@ def _remove_accents_(unicode_filename):
 
 
 if __name__ == '__main__':
-    MM_home = '/Users/mcgoug01/Downloads/SSL_Data'
+    MM_home = '/bask/projects/p/phwq4930-renal-canc/data/SSL_Data/'
     MR_dir = os.path.join(MM_home, 'MR')
     CT_dir = os.path.join(MM_home, 'CT')
 
+<<<<<<< HEAD
     for mode_path in [MR_dir,CT_dir]:
         m_im_p = os.path.join(mode_path, 'images_alt')
+=======
+    for mode_path in [CT_dir,MR_dir]:
+        m_im_p = os.path.join(mode_path, 'images')
+>>>>>>> f8740bd (update HPc)
         if not os.path.exists(m_im_p): os.makedirs(m_im_p)
 
         for dataset in [dir for dir in os.listdir(mode_path) if (os.path.isdir(os.path.join(mode_path,dir))) and (dir!='images')]:
             for series in [dir for dir in os.listdir(os.path.join(mode_path, dataset)) if (os.path.isdir(os.path.join(mode_path,dataset,dir)))]:
-                print(mode_path)
-                print(dataset)
-                print(series)
                 s_im_p = os.path.join(m_im_p, dataset+'#'+series+'.nii.gz')
                 try:
                     convert_directory(os.path.join(mode_path, dataset, series), s_im_p, compression=True,
