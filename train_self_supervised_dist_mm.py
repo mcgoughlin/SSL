@@ -258,7 +258,6 @@ class MIMTransform():
         )
     
     def __call__(self, img):
-        print(img)
         img = self.transform_img(img)
         mask = self.mask_generator()
         mask2 = self.mask_generator()

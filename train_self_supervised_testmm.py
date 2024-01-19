@@ -10,8 +10,18 @@ import os
 import json
 import time
 import torch
+from monai.config import DtypeLike, KeysCollection
+from monai.transforms.transform import MapTransform
+from monai.transforms.io.array import LoadImage
+from monai.data.image_reader import ImageReader
+from monai.utils import ensure_tuple_rep, ensure_tuple
+import sys
+
 #import matplotlib.pyplot as plt
 #Below all for SimMIM
+
+from monai.utils.enums import PostFix
+DEFAULT_POST_FIX = PostFix.meta()
 
 import argparse
 
@@ -211,13 +221,95 @@ class MaskGenerator:
         return token_mask, mask
 
 
+class PrintandLoadImageD(MapTransform):
+
+    def __init__(
+        self,
+        keys: KeysCollection,
+        reader: type[ImageReader] | str | None = None,
+        dtype: DtypeLike = np.float32,
+        meta_keys: KeysCollection | None = None,
+        meta_key_postfix: str = DEFAULT_POST_FIX,
+        overwriting: bool = False,
+        image_only: bool = True,
+        ensure_channel_first: bool = False,
+        simple_keys: bool = False,
+        prune_meta_pattern: str | None = None,
+        prune_meta_sep: str = ".",
+        allow_missing_keys: bool = False,
+        expanduser: bool = True,
+        *args,
+        **kwargs,
+    ) -> None:
+
+        super().__init__(keys, allow_missing_keys)
+        self._loader = LoadImage(
+            reader,
+            image_only,
+            dtype,
+            ensure_channel_first,
+            simple_keys,
+            prune_meta_pattern,
+            prune_meta_sep,
+            expanduser,
+            *args,
+            **kwargs,
+        )
+        if not isinstance(meta_key_postfix, str):
+            raise TypeError(f"meta_key_postfix must be a str but is {type(meta_key_postfix).__name__}.")
+        self.meta_keys = ensure_tuple_rep(None, len(self.keys)) if meta_keys is None else ensure_tuple(meta_keys)
+        if len(self.keys) != len(self.meta_keys):
+            raise ValueError(
+                f"meta_keys should have the same length as keys, got {len(self.keys)} and {len(self.meta_keys)}."
+            )
+        self.meta_key_postfix = ensure_tuple_rep(meta_key_postfix, len(self.keys))
+        self.overwriting = overwriting
+
+    def register(self, reader: ImageReader):
+        self._loader.register(reader)
+
+    def __call__(self, data, reader: ImageReader | None = None):
+        """
+        Raises:
+            KeyError: When not ``self.overwriting`` and key already exists in ``data``.
+
+        """
+        d = dict(data)
+        for key, meta_key, meta_key_postfix in self.key_iterator(d, self.meta_keys, self.meta_key_postfix):
+            try:
+                data = self._loader(d[key], reader)
+                if self._loader.image_only:
+                    d[key] = data
+                else:
+                    if not isinstance(data, (tuple, list)):
+                        raise ValueError(
+                            f"loader must return a tuple or list (because image_only=False was used), got {type(data)}."
+                        )
+                    d[key] = data[0]
+                    if not isinstance(data[1], dict):
+                        raise ValueError(f"metadata must be a dict, got {type(data[1])}.")
+                    meta_key = meta_key or f"{key}_{meta_key_postfix}"
+                    if meta_key in d and not self.overwriting:
+                        raise KeyError(f"Metadata with key {meta_key} already exists and overwriting=False.")
+                    d[meta_key] = data[1]
+
+            # catch exception, print file name and the exception message
+            except Exception as e:
+                sys.stdout.write('#' * 10 + '\n' + d[key] + '\n' + '#' * 10)
+                sys.stdout.write(f"Error when reading {d[key]}: {e}")
+                sys.stdout.flush()
+                raise e
+        return d
+
+
+
 class MIMTransform():
 
     def __init__(self, crop_num=5):
     #def __init__(self):
         self.transform_img = Compose(
         [
-        LoadImaged(keys=["image"], reader="NibabelReader"),
+        PrintandLoadImageD(keys=["image"], reader="NibabelReader"),
         EnsureChannelFirstd(keys=["image"]),
         Spacingd(keys=["image"], pixdim=(
             2.0, 2.0, 2.0), mode=("bilinear")),
@@ -243,7 +335,6 @@ class MIMTransform():
         )
     
     def __call__(self, img):
-        print(img)
         img = self.transform_img(img)
         mask = self.mask_generator()
         mask2 = self.mask_generator()
@@ -300,7 +391,7 @@ def main():
     with open(json_Path, 'r') as json_f:
         json_Data = json.load(json_f)
 
-    train_Data=json_Data['DeepLesion']
+    train_Data=json_Data['DeepLesion'] + json_Data['all_cect']
 
 
     print('Total Number of Training Data Samples: {}'.format(len(train_Data)))
@@ -420,11 +511,10 @@ def main():
         #print the next batch
 
 
-        for batch_data, train_mask_all1,train_mask_all2 in train_loader:
+        for batch_data, train_mask_all1, train_mask_all2 in train_loader:
 
             token_mask1,mask1=train_mask_all1[0],train_mask_all1[1]
             token_mask2,mask2=train_mask_all2[0],train_mask_all2[1]
-            
             
 
             steps_in_epoch=steps_in_epoch+1
