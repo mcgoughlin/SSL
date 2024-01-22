@@ -2,7 +2,9 @@ import matplotlib
 matplotlib.use('Agg')
 #import UnetsegLSTM
 #matplotlib.use('pdf')
-import torch 
+import torch
+from monai.data.meta_tensor import MetaTensor
+
 
 #torch.backends.cudnn.enabled = False
 import matplotlib.pyplot as plt
@@ -15,7 +17,6 @@ from monai.transforms.transform import MapTransform
 from monai.transforms.io.array import LoadImage
 from monai.data.image_reader import ImageReader
 from monai.utils import ensure_tuple_rep, ensure_tuple
-import sys
 
 #import matplotlib.pyplot as plt
 #Below all for SimMIM
@@ -278,6 +279,12 @@ class PrintandLoadImageD(MapTransform):
         for key, meta_key, meta_key_postfix in self.key_iterator(d, self.meta_keys, self.meta_key_postfix):
             try:
                 data = self._loader(d[key], reader)
+
+                if len(data.shape) >3:
+                    data = data.select(torch.argmin(torch.Tensor(list(data.shape))), 0)
+                    data._meta['dim'] = np.array([3,*data.shape,1,1,1,1])
+                    data._meta['original_channel_dim'] = np.nan
+
                 if self._loader.image_only:
                     d[key] = data
                 else:
@@ -293,12 +300,9 @@ class PrintandLoadImageD(MapTransform):
                         raise KeyError(f"Metadata with key {meta_key} already exists and overwriting=False.")
                     d[meta_key] = data[1]
 
-            # catch exception, print file name and the exception message
             except Exception as e:
-                sys.stdout.write('#' * 10 + '\n' + d[key] + '\n' + '#' * 10)
-                sys.stdout.write(f"Error when reading {d[key]}: {e}")
-                sys.stdout.flush()
                 raise e
+
         return d
 
 
@@ -307,7 +311,7 @@ class MIMTransform():
 
     def __init__(self, crop_num=5):
     #def __init__(self):
-        self.transform_img = Compose(
+        self.transform_img_CT = Compose(
         [
         PrintandLoadImageD(keys=["image"], reader="NibabelReader"),
         EnsureChannelFirstd(keys=["image"]),
@@ -325,6 +329,25 @@ class MIMTransform():
 
         ]
         )
+
+        self.transform_img_MR = Compose(
+            [
+                PrintandLoadImageD(keys=["image"], reader="NibabelReader"),
+                EnsureChannelFirstd(keys=["image"]),
+                Spacingd(keys=["image"], pixdim=(
+                    2.0, 2.0, 2.0), mode=("bilinear")),
+                ScaleIntensityRanged(
+                    keys=["image"], a_min=0, a_max=1000,
+                    b_min=0.0, b_max=1.0, clip=True
+                ),
+                CropForegroundd(keys=["image"], source_key="image"),
+                SpatialPadd(keys=["image"], spatial_size=(128, 128, 128)),
+                RandSpatialCropSamplesd(keys=["image"], roi_size=(128, 128, 128), random_size=False, num_samples=1),
+
+                RandSpatialCropSamplesd(keys=["image"], roi_size=(96, 96, 96), random_size=False, num_samples=crop_num),
+
+            ]
+        )
  
         
         self.mask_generator = MaskGenerator(
@@ -335,7 +358,13 @@ class MIMTransform():
         )
     
     def __call__(self, img):
-        img = self.transform_img(img)
+        if 'CT' or 'DeepLesion' in img:
+            img = self.transform_img_CT(img)
+        elif 'MR' in d[key]:
+            img = self.transform_img_MR(img)
+        else:
+            raise ValueError(f"modality must be CT or MR, got {d[key]}.")
+
         mask = self.mask_generator()
         mask2 = self.mask_generator()
         #mask3 = self.mask_generator()
@@ -368,7 +397,7 @@ def main():
     # https://wiki.cancerimagingarchive.net/display/Public/Pancreas-CT#22514040622363b40c0a4da9bf1c2c728d90d54f
     
     json_Path = os.path.normpath('mm_ssl_train.json')
-    logdir_path = os.path.normpath(sv_str+'/mmtest_'+str(cls_w)+'_'+str(patch_w)+'_'+str(rec_w)+'_'+str(max_epochs)+'_'+str(batch_size))
+    logdir_path = os.path.normpath(sv_str+'/mmtestwithMR_'+str(cls_w)+'_'+str(patch_w)+'_'+str(rec_w)+'_'+str(max_epochs)+'_'+str(batch_size))
 
     
     
@@ -391,7 +420,7 @@ def main():
     with open(json_Path, 'r') as json_f:
         json_Data = json.load(json_f)
 
-    train_Data=json_Data['DeepLesion'] + json_Data['all_cect']
+    train_Data=json_Data['DeepLesion'] +json_Data['CT'] + json_Data['MR']
 
 
     print('Total Number of Training Data Samples: {}'.format(len(train_Data)))
@@ -487,9 +516,9 @@ def main():
                     transform=train_Transforms,
                     cache_num=500,  #500 is good
                     cache_rate=1.0,
-                    num_workers=5,
+                    num_workers=8,
                 )
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=5)
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=8)
 
     momentum_teacher=0.996
 
