@@ -27,7 +27,7 @@ def get_3DTransSmall_config_Unetr():
     config.reg_head_chan = 16
 
     config.patch_size = 2
-    config.img_size = (96, 96, 96)
+    config.img_size = (64, 64, 64)
     
     config.window_size = (4, 4, 4)
 

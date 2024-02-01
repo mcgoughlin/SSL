@@ -4,8 +4,8 @@ matplotlib.use('Agg')
 #matplotlib.use('pdf')
 import torch
 from monai.data.meta_tensor import MetaTensor
+from datetime import timedelta
 from utils.data_utils import Sampler
-
 
 #torch.backends.cudnn.enabled = False
 import matplotlib.pyplot as plt
@@ -60,6 +60,7 @@ from monai.transforms import (
 from models.Trans import CONFIGS as CONFIGS_TM
 import models.Trans as Trans
 import torch.nn.functional as F
+import torch.multiprocessing as mp
 
 fig = plt.figure()
 ax = fig.add_subplot(211)
@@ -122,7 +123,6 @@ class Cls_Patch_Loss(nn.Module):
         temp = self.teacher_temp_schedule[epoch]
         temp2 = self.teacher_temp2_schedule[epoch]
 
-
         
         teacher_cls_c = F.softmax((teacher_cls - self.center) / temp, dim=-1)
         teacher_cls_c = teacher_cls_c.detach().chunk(chunk_num)
@@ -172,13 +172,13 @@ class Cls_Patch_Loss(nn.Module):
         """
 
         cls_center = torch.sum(teacher_cls, dim=0, keepdim=True)
-        #dist.all_reduce(cls_center)
+        dist.all_reduce(cls_center)
         cls_center = cls_center / (len(teacher_cls)) 
         self.center = self.center * self.center_momentum + cls_center * (1 - self.center_momentum)
         #self.center = self.center * self.center_momentum + cls_center * (1 - self.center_momentum)
 
         patch_center = torch.sum(teacher_patch.mean(1), dim=0, keepdim=True)
-        #dist.all_reduce(patch_center)
+        dist.all_reduce(patch_center)
         patch_center = patch_center / (len(teacher_patch) )
         #patch_center = patch_center / (len(teacher_patch) * dist.get_world_size())
         self.center2 = self.center2 * self.center_momentum2 + patch_center * (1 - self.center_momentum2)
@@ -191,6 +191,18 @@ def parse_option():
     parser.add_argument('--rec_w', type=float, default=1, required=False, help="weight for reconstruction loss")
     parser.add_argument('--sv_str', type=str, default='tep_sv', required=False, help="batch size for single GPU")
     parser.add_argument('--ibot_head_share', type=int, default=0, required=False, help="whether to used the shared weight")
+    parser.add_argument('--world_size', default=1, type=int, help='number of nodes for distributed training')
+    parser.add_argument('--rank', default=0, type=int, help='node rank for distributed training')
+    parser.add_argument('--dist-url', default='tcp://127.0.0.1:23456', type=str, help='distributed url')
+    parser.add_argument('--dist-backend', default='nccl', type=str, help='distributed backend')
+    parser.add_argument('--workers', default=8, type=int, help='number of workers')
+    parser.add_argument('--batch_size', default=16, type=int, help='batch size for single GPU')
+    parser.add_argument('--max_epochs', default=700, type=int, help='number of workers')
+    parser.add_argument('--distributed', action='store_true', help='start distributed training')
+    parser.add_argument('--noamp', action='store_true', help='use amp')
+    parser.add_argument('--logdir', default='tep_sv', type=str, help='logdir name')
+    parser.add_argument('--ngpus_per_node', default=1, type=int, help='number of gpus per node')
+    parser.add_argument('--base_lr', default=0.00002, type=float, help='base learning rate')
 
     args = parser.parse_args()
     
@@ -223,7 +235,6 @@ class MaskGenerator:
         mask = mask.repeat(self.scale, axis=0).repeat(self.scale, axis=1).repeat(self.scale, axis=2)
         
         return token_mask, mask
-
 
 class PrintandLoadImageD(MapTransform):
 
@@ -309,28 +320,27 @@ class PrintandLoadImageD(MapTransform):
         return d
 
 
-
 class MIMTransform():
 
     def __init__(self, crop_num=5):
-    #def __init__(self):
+        # def __init__(self):
         self.transform_img_CT = Compose(
-        [
-        PrintandLoadImageD(keys=["image"], reader="NibabelReader"),
-        EnsureChannelFirstd(keys=["image"]),
-        Spacingd(keys=["image"], pixdim=(
-            4.0, 4.0, 4.0), mode=("bilinear")),
-        ScaleIntensityRanged(
-            keys=["image"], a_min=-175, a_max=250,
-            b_min=0.0, b_max=1.0, clip=True
-        ),
-        CropForegroundd(keys=["image"], source_key="image"),
-        SpatialPadd(keys=["image"], spatial_size=(96, 96, 96)),
-        RandSpatialCropSamplesd(keys=["image"], roi_size=(96, 96, 96), random_size=False, num_samples=1),
+            [
+                PrintandLoadImageD(keys=["image"], reader="NibabelReader"),
+                EnsureChannelFirstd(keys=["image"]),
+                Spacingd(keys=["image"], pixdim=(
+                    4.0, 4.0, 4.0), mode=("bilinear")),
+                ScaleIntensityRanged(
+                    keys=["image"], a_min=-175, a_max=250,
+                    b_min=0.0, b_max=1.0, clip=True
+                ),
+                CropForegroundd(keys=["image"], source_key="image"),
+                SpatialPadd(keys=["image"], spatial_size=(96, 96, 96)),
+                RandSpatialCropSamplesd(keys=["image"], roi_size=(96, 96, 96), random_size=False, num_samples=1),
 
-        RandSpatialCropSamplesd(keys=["image"], roi_size=(64, 64, 64), random_size=False, num_samples=crop_num),
+                RandSpatialCropSamplesd(keys=["image"], roi_size=(64, 64, 64), random_size=False, num_samples=crop_num),
 
-        ]
+            ]
         )
 
         self.transform_img_MR = Compose(
@@ -352,59 +362,77 @@ class MIMTransform():
 
             ]
         )
- 
-        
+
         self.mask_generator = MaskGenerator(
             input_size=64,
-            mask_patch_size=16,#
-            model_patch_size=2,#,
+            mask_patch_size=16,  #
+            model_patch_size=2,  # ,
             mask_ratio=0.7,
         )
 
-
     def __call__(self, img):
-        if 'CT' or 'DeepLesion' in img:
-            img = self.transform_img_CT(img)
-        elif 'MR' in d[key]:
-            img = self.transform_img_MR(img)
-        else:
-            raise ValueError(f"modality must be CT or MR, got {d[key]}.")
+        # if 'CT' or 'DeepLesion' in img:
+        #     img = self.transform_img_CT(img)
+        # elif 'MR' in d[key]:
+        #     img = self.transform_img_MR(img)
+        # else:
+        #     raise ValueError(f"modality must be CT or MR, got {d[key]}.")
+
+        img = self.transform_img_CT(img)
 
         mask = self.mask_generator()
         mask2 = self.mask_generator()
-        #mask3 = self.mask_generator()
-        #mask4 = self.mask_generator()
-        #mask5 = self.mask_generator()
-        
-        return img, mask,mask2#,mask3,mask4,mask5
+        # mask3 = self.mask_generator()
+        # mask4 = self.mask_generator()
+        # mask5 = self.mask_generator()
+
+        return img, mask, mask2  # ,mask3,mask4,mask5
 
 
 def main():
+    args = parse_option()
+
+    args.amp = not args.noamp
+    args.logdir = './runs/' + args.logdir
+    if args.distributed:
+        args.ngpus_per_node = torch.cuda.device_count()
+        print('Found total gpus', args.ngpus_per_node)
+        args.world_size = args.ngpus_per_node * args.world_size
+        mp.spawn(main_worker,
+                 nprocs=args.ngpus_per_node,
+                 args=(args,))
+    else:
+        main_worker(gpu=0, args=args)
+
+def main_worker(gpu,args):
     
     #TODO Defining file paths & output directory path
 
-    args = parse_option()
-
+    if args.distributed:
+        torch.multiprocessing.set_start_method('fork', force=True)
+    np.set_printoptions(formatter={'float': '{: 0.3f}'.format}, suppress=True)
+    args.gpu = gpu
+    if args.distributed:
+        args.rank = args.rank * args.ngpus_per_node + gpu
+        dist.init_process_group(backend=args.dist_backend,
+                                init_method=args.dist_url,
+                                world_size=args.world_size,
+                                rank=args.rank,
+                                timeout=timedelta(60))
+    torch.cuda.set_device(args.gpu)
+    print(args.rank, ' gpu', args.gpu)
+    if args.rank == 0:
+        print('Batch size is:', args.batch_size, 'epochs', args.max_epochs)
 
     cls_w=args.cls_w
     patch_w=args.patch_w
     rec_w=args.rec_w
     sv_str=args.sv_str
     ibot_head_share=args.ibot_head_share
-
-    max_epochs = 1000
-    batch_size = 60
-
-    # your data path
-    data_Root = os.path.normpath('')
-    # the json fine 
-    # you can have a quick test using the tcia pancreas data which have 82 data 
-    # https://wiki.cancerimagingarchive.net/display/Public/Pancreas-CT#22514040622363b40c0a4da9bf1c2c728d90d54f
     
     json_Path = os.path.normpath('mm_ssl_train.json')
-    logdir_path = os.path.normpath(sv_str+'/mmtestwithMR_'+str(cls_w)+'_'+str(patch_w)+'_'+str(rec_w)+'_'+str(max_epochs)+'_'+str(batch_size))
+    logdir_path = os.path.normpath(sv_str+'/ogmask_singlerecloss_'+str(args.max_epochs)+'_'+str(args.batch_size)+'_'+str(args.ngpus_per_node))
 
-    
     
     epoch_loss_values = []
     lr_values=[]
@@ -416,16 +444,18 @@ def main():
     best_val_loss = 1000.0
 
     chunk_num=2
-    lr = 0.00005*batch_size
+    lr = args.base_lr*args.batch_size
 
-    if os.path.exists(logdir_path)==False:
+    if (not os.path.exists(logdir_path)) and (args.rank == 0):
         os.mkdir(logdir_path)
-    print ('info',logdir_path)
+    print('info',logdir_path)
     # Load Json & Append Root Path
     with open(json_Path, 'r') as json_f:
         json_Data = json.load(json_f)
 
-    train_Data=json_Data['DeepLesion'] +json_Data['CT'] + json_Data['MR']
+    print(json_Data.keys())
+
+    train_Data=json_Data['CT'] + json_Data['DeepLesion'] #+ json_Data['MR']
 
 
     print('Total Number of Training Data Samples: {}'.format(len(train_Data)))
@@ -437,7 +467,7 @@ def main():
     teacher_temp=0.07
     warmup_teacher_patch_temp=0.04
     teacher_patch_temp=0.07
-    ars_epochs=max_epochs
+    ars_epochs=args.max_epochs
     pred_start_epoch=30
     global_crops_number=2
     local_crops_number=0
@@ -470,29 +500,44 @@ def main():
     Val_Transforms = train_Transforms
 
     check_ds = Dataset(data=train_Data, transform=train_Transforms)
-    check_loader = DataLoader(check_ds, batch_size=1)
-    
+    check_sampler = Sampler(check_ds, shuffle=False) if args.distributed else None
+    check_loader = data.DataLoader(check_ds,
+                                  batch_size=args.batch_size,
+                                  shuffle=False,
+                                  num_workers=args.workers,
+                                  sampler=check_sampler,
+                                  pin_memory=True,
+                                  persistent_workers=True)
 
-    # Define Network ViT backbone & Loss & Optimizer
-    device = torch.device("cuda:0")
 
     config = CONFIGS_TM['Trans-Small_SMIT_pre_train'] #
     print(config)
     # get the student model  shared weights
 
     #
-    if ibot_head_share:
-        model_S = Trans.Trans_SMIT_pre_train_Student(config)
-        model_T = Trans.Trans_SMIT_pre_train_Teacher(config)
 
+    model_S = Trans.Trans_Unetr_student(config, 1)
+    model_T = Trans.Trans_Unetr_teacher(config, 1)
+
+    model_S.cuda(args.gpu), model_T.cuda(args.gpu)
+    if args.distributed:
+        torch.cuda.set_device(args.gpu)
+        model_S.cuda(args.gpu)
+        model_T.cuda(args.gpu)
+        model_S = torch.nn.parallel.DistributedDataParallel(model_S,
+                                                          device_ids=[args.gpu],
+                                                          output_device=args.gpu,
+                                                          find_unused_parameters=True)
+
+        model_T = torch.nn.parallel.DistributedDataParallel(model_T,
+                                                            device_ids=[args.gpu],
+                                                            output_device=args.gpu,
+                                                            find_unused_parameters=True)
     else:
-        model_S = Trans.Trans_SMIT_pre_train_Student_No_Share(config)
-        model_T = Trans.Trans_SMIT_pre_train_Teacher_No_Share(config) 
+        model_S.cuda()
+        model_T.cuda()
 
 
-
-    model_S.cuda()
-    model_T.cuda()
     # modle_T won't update parameters
     for p in model_T.parameters():
         p.requires_grad = False
@@ -502,8 +547,6 @@ def main():
     # Define Hyper-paramters for training loop
 
 
-    
-    
     #optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     optimizer = torch.optim.AdamW(model_S.parameters(), lr=lr)
 
@@ -511,29 +554,43 @@ def main():
     if lrschedule == 'warmup_cosine':
         scheduler = LinearWarmupCosineAnnealingLR(optimizer,
                                                   warmup_epochs=20,
-                                                  max_epochs=max_epochs)
+                                                  max_epochs=ars_epochs)
     if lrschedule == 'cosine_anneal':
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer,
-                                                               T_max=max_epochs)
+                                                               T_max=ars_epochs)
 
     train_ds = data.Dataset(
                     data=train_Data,
                     transform=train_Transforms,
                     # cache_num=500,  #500 is good
                     # cache_rate=1.0,
-                    # num_workers=8,
+                    # num_workers=args.workers,
                 )
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=16)
+
+    train_sampler = Sampler(train_ds, shuffle=False) if args.distributed else None
+    train_loader = data.DataLoader(train_ds,
+                                  batch_size=args.batch_size,
+                                  shuffle=False,
+                                  num_workers=args.workers,
+                                  sampler=train_sampler,
+                                  pin_memory=True,
+                                  persistent_workers=True)
 
     momentum_teacher=0.996
 
     momentum_schedule = train_utils.cosine_scheduler(momentum_teacher, 1,
-                                            max_epochs, len(train_loader))
+                                            args.max_epochs, len(train_loader))
     
     iter_num=0
-    for epoch in range(max_epochs):
-        print("-" * 10)
-        print(f"epoch {epoch + 1}/{max_epochs}")
+
+    for epoch in range(args.max_epochs):
+        if args.distributed:
+            train_loader.sampler.set_epoch(epoch)
+            torch.distributed.barrier()
+
+        if args.rank == 0:
+            print("-" * 10)
+            print(f"epoch {epoch + 1}/{args.max_epochs}")
         model_S.train()
         epoch_loss = 0
         epoch_cl_loss = 0
@@ -545,55 +602,42 @@ def main():
         #print the next batch
 
 
-        for batch_data, train_mask_all1, train_mask_all2 in train_loader:
+        for idx, (batch_data, train_mask_all1,train_mask_all2) in enumerate(train_loader):
 
             token_mask1,mask1=train_mask_all1[0],train_mask_all1[1]
             token_mask2,mask2=train_mask_all2[0],train_mask_all2[1]
-            
+
 
             steps_in_epoch=steps_in_epoch+1
             step += 1
             iter_num +=1
             start_time = time.time()
             #print (batch_data)
-            image1=batch_data[0][0]["image"].to(device)
-            image2=batch_data[0][1]["image"].to(device)
-            
+            image1=batch_data[0][0]["image"]
+            image2=batch_data[0][1]["image"]
 
-            
-
-            img_all=torch.cat((image1,image2),dim=0)
-            mask_all=torch.cat((mask1,mask2),dim=0)
+            img_all=torch.cat((image1,image2),dim=0).cuda(args.rank)
+            mask_all=torch.cat((mask1,mask2),dim=0).cuda(args.rank)
                 
-            token_mask_all=torch.cat((token_mask1,token_mask2),dim=0)
+            token_mask_all=torch.cat((token_mask1,token_mask2),dim=0).cuda(args.rank)
             
             optimizer.zero_grad()
 
-            mask_all=mask_all.cuda()
             student_token,x_rec = model_S(img_all,mask_all)
             teacher_token = model_T(img_all)
             #teacher_token_cls = model_T(img_all)
 
             # calculate the image reconstruction loss for student
             mask_interp = mask_all.repeat_interleave(2, 1).repeat_interleave(2, 2).repeat_interleave(2, 3).unsqueeze(1).contiguous()
-        
+
             loss_recon = F.l1_loss(img_all, x_rec, reduction='none')
-
-            loss_recon = (loss_recon * mask_interp).sum() / (mask_interp.sum() + 1e-5) 
-            
-            #print ('token_mask_all shape',token_mask_all.shape)
-
+            loss_recon = (loss_recon * mask_interp).sum() / (mask_interp.sum() + 1e-5)
             loss_token,loss_token_cls = cls_patch_loss(student_token, teacher_token, token_mask_all, epoch,chunk_num)
 
             loss=loss_token+loss_token_cls+rec_w*loss_recon
-            
-            
-            
+
             loss.backward()
-            
             train_utils.cancel_gradients_last_layer(epoch, model_S,1)
-
-
 
             optimizer.step()
             # EMA update for the teacher
@@ -613,105 +657,110 @@ def main():
                 for param_q, param_k in zip(params_q, params_k):
                     param_k.data.mul_(m).add_((1 - m) * param_q.detach().data)
 
-            
-            if iter_num %100==0:
-                val_img_save=image1[0].float()#.cuda()=
-                val_img_save=val_img_save.data.cpu().numpy()
-                val_img_save=np.squeeze(val_img_save)
-                val_img_save = nib.Nifti1Image(val_img_save,np.eye(4))    
-                pred_sv_name_img=logdir_path+'/train_debug_Input.nii.gz'
+
+            val_img_save=image1[0].float()#.cuda()=
+            val_img_save=val_img_save.data.cpu().numpy()
+            val_img_save=np.squeeze(val_img_save)
+            val_img_save = nib.Nifti1Image(val_img_save,np.eye(4))
+            pred_sv_name_img=logdir_path+'/train_debug_Input.nii.gz'
+            if args.rank==0:
                 nib.save(val_img_save, pred_sv_name_img)
 
-                val_img_save=image2[0].float()#.cuda()=
-                val_img_save=val_img_save.data.cpu().numpy()
-                val_img_save=np.squeeze(val_img_save)
-                val_img_save = nib.Nifti1Image(val_img_save,np.eye(4))    
-                pred_sv_name_img=logdir_path+'/train_debug_Input2.nii.gz'
+            val_img_save=image2[0].float()#.cuda()=
+            val_img_save=val_img_save.data.cpu().numpy()
+            val_img_save=np.squeeze(val_img_save)
+            val_img_save = nib.Nifti1Image(val_img_save,np.eye(4))
+            pred_sv_name_img=logdir_path+'/train_debug_Input2.nii.gz'
+            if args.rank == 0:
                 nib.save(val_img_save, pred_sv_name_img)
 
-                mask_sv = mask_all.repeat_interleave(2, 1).repeat_interleave(2, 2).repeat_interleave(2, 3).unsqueeze(1).contiguous()
-                val_img_save=mask_sv[0].float()#.cuda()=
-                val_img_save=val_img_save.data.cpu().numpy()
-                val_img_save=np.squeeze(val_img_save)
-                val_img_save = nib.Nifti1Image(val_img_save,np.eye(4))    
-                pred_sv_name_img=logdir_path+'/train_debug_Mask.nii.gz'
-                nib.save(val_img_save, pred_sv_name_img)  
+            mask_sv = mask_all.repeat_interleave(2, 1).repeat_interleave(2, 2).repeat_interleave(2, 3).unsqueeze(1).contiguous()
+            val_img_save=mask_sv[0].float()#.cuda()=
+            val_img_save=val_img_save.data.cpu().numpy()
+            val_img_save=np.squeeze(val_img_save)
+            val_img_save = nib.Nifti1Image(val_img_save,np.eye(4))
+            pred_sv_name_img=logdir_path+'/train_debug_Mask.nii.gz'
+            if args.rank == 0:
+                nib.save(val_img_save, pred_sv_name_img)
 
-                val_img_save=x_rec[0].float()#.cuda()=
-                val_img_save=val_img_save.data.cpu().numpy()
-                val_img_save=np.squeeze(val_img_save)
-                val_img_save = nib.Nifti1Image(val_img_save,np.eye(4))    
-                pred_sv_name_img=logdir_path+'/train_debug_Pred.nii.gz'
-                nib.save(val_img_save, pred_sv_name_img)  
+            val_img_save=x_rec[0].float()#.cuda()=
+            val_img_save=val_img_save.data.cpu().numpy()
+            val_img_save=np.squeeze(val_img_save)
+            val_img_save = nib.Nifti1Image(val_img_save,np.eye(4))
+            pred_sv_name_img=logdir_path+'/train_debug_Pred.nii.gz'
+            if args.rank == 0:
+                nib.save(val_img_save, pred_sv_name_img)
 
-            
-            total_loss = loss
-            cl_loss=loss_token#+loss_token2
-            r_loss=loss_recon#+loss_recon2
-            cls_loss=loss_token_cls#+loss_token_cls2
-            #total_loss.backward()
-            #optimizer.step()
-            epoch_loss += total_loss.item()
-            step_loss_values.append(total_loss.item())
+            torch.distributed.reduce(loss, 0), torch.distributed.reduce(loss_token, 0), torch.distributed.reduce(loss_recon, 0), torch.distributed.reduce(loss_token_cls, 0)
 
-            # CL & Recon Loss Storage of Value
-            epoch_cl_loss += cl_loss.item()
-            epoch_recon_loss += r_loss.item()
-            epoch_cl_class_loss += cls_loss.item()
+            if (args.rank==0):
+                total_loss = loss
+                cl_loss=loss_token#+loss_token2
+                r_loss=loss_recon#+loss_recon2
+                cls_loss=loss_token_cls#+loss_token_cls2
+                #total_loss.backward()
+                #optimizer.step()
+                epoch_loss += total_loss.item()
+                step_loss_values.append(total_loss.item())
 
-            end_time = time.time()
-            if step %20 ==0:
-                print(
-                    f"{step}/{len(train_ds) // train_loader.batch_size}, "
-                    f"train_loss: {total_loss.item():.4f}, "
-                    f"train_loss_token: {cl_loss.item():.4f}, "
-                    f"train_loss_cls_token: {cls_loss.item():.4f}, "
-                    f"train_loss_recon: {r_loss.item():.4f}, "
+                # CL & Recon Loss Storage of Value
+                epoch_cl_loss += cl_loss.item()
+                epoch_recon_loss += r_loss.item()
+                epoch_cl_class_loss += cls_loss.item()
+
+                if (step %20 ==0):
+                    end_time = time.time()
+                    print(
+                        f"{step}/{len(train_ds) // train_loader.batch_size}, "
+                        f"train_loss: {total_loss.item():.4f}, "
+                        f"train_loss_token: {cl_loss.item():.4f}, "
+                        f"train_loss_cls_token: {cls_loss.item():.4f}, "
+                        f"train_loss_recon: {r_loss.item():.4f}, "
                     f"time taken: {end_time-start_time}s")
 
-        epoch_loss /= step
-        epoch_cl_loss /= step
-        epoch_cl_class_loss /=step
-        epoch_recon_loss /= step
-        cur_lr=scheduler.get_last_lr()
-        lr_values.append(cur_lr)
+        if (args.rank == 0):
+            epoch_loss /= step
+            epoch_cl_loss /= step
+            epoch_cl_class_loss /=step
+            epoch_recon_loss /= step
+            cur_lr=scheduler.get_last_lr()
+            lr_values.append(cur_lr)
+            epoch_loss_values.append(epoch_loss)
+            epoch_cl_loss_values.append(epoch_cl_loss)
+            epoch_cl_loss_class_values.append(epoch_cl_class_loss)
+            epoch_recon_loss_values.append(epoch_recon_loss)
 
-        epoch_loss_values.append(epoch_loss)
-        epoch_cl_loss_values.append(epoch_cl_loss)
-        epoch_cl_loss_class_values.append(epoch_cl_class_loss)
-        epoch_recon_loss_values.append(epoch_recon_loss)
-        print(f"epoch {epoch + 1} average loss: {epoch_loss:.4f}")
-        checkpoint = {'epoch': 1,'state_dict': model_S.transformer.state_dict(),'optimizer': optimizer.state_dict()}
+            print(f"epoch {epoch + 1} average loss: {epoch_loss:.4f}")
+            checkpoint = {'epoch': 1,'state_dict': model_S.state_dict(),'optimizer': optimizer.state_dict()}
+            # save the model
+            torch.save(checkpoint, os.path.join(logdir_path, 'pre_train_model.pt'))
 
-        
-        # save and print loss
-        plt.figure(1, figsize=(8, 8))
-        plt.subplot(2, 2, 1)
-        plt.plot(epoch_loss_values)
-        plt.grid()
-        plt.title('Training Loss')
+            # save and print loss
+            plt.figure(1, figsize=(8, 8))
+            plt.subplot(2, 2, 1)
+            plt.plot(epoch_loss_values)
+            plt.grid()
+            plt.title('Training Loss')
 
-        plt.subplot(2, 2, 2)
-        plt.plot(epoch_cl_loss_class_values)
-        plt.grid()
-        plt.title('Training Class Token Loss')
+            plt.subplot(2, 2, 2)
+            plt.plot(epoch_cl_loss_class_values)
+            plt.grid()
+            plt.title('Training Class Token Loss')
 
-        plt.subplot(2, 2, 3)
-        plt.plot(epoch_cl_loss_values)
-        plt.grid()
-        plt.title('Training Feature Token Loss')
+            plt.subplot(2, 2, 3)
+            plt.plot(epoch_cl_loss_values)
+            plt.grid()
+            plt.title('Training Feature Token Loss')
 
-        plt.subplot(2, 2, 4)
-        plt.plot(epoch_recon_loss_values)
-        plt.grid()
-        plt.title('Training Image Pred Loss')
+            plt.subplot(2, 2, 4)
+            plt.plot(epoch_recon_loss_values)
+            plt.grid()
+            plt.title('Training Image Pred Loss')
 
-        plt.savefig(os.path.join(logdir_path, 'Training_loss_plots.png'))
-        plt.close(1)
+            plt.savefig(os.path.join(logdir_path, 'Training_loss_plots.png'))
+            plt.close(1)
+
         scheduler.step()
-        
-        #save the model
-        torch.save(checkpoint, os.path.join(logdir_path, 'pre_train_model.pt'))
     print('Done')
     return None
 

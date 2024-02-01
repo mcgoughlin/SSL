@@ -191,7 +191,9 @@ def parse_option():
     parser.add_argument('--rec_w', type=float, default=1, required=False, help="weight for reconstruction loss")
     parser.add_argument('--sv_str', type=str, default='tep_sv', required=False, help="batch size for single GPU")
     parser.add_argument('--ibot_head_share', type=int, default=0, required=False, help="whether to used the shared weight")
-
+    parser.add_argument('--batch_size', type=int, default=60, required=False, help="batch size for single GPU")
+    parser.add_argument('--max_epochs', type=int, default=1000, required=False, help="batch size for single GPU")
+    parser.add_argument('--base_lr', type=float, default=0.00005, required=False, help="batch size for single GPU")
     args = parser.parse_args()
     
     return args
@@ -392,8 +394,8 @@ def main():
     sv_str=args.sv_str
     ibot_head_share=args.ibot_head_share
 
-    max_epochs = 1000
-    batch_size = 60
+    max_epochs = args.max_epochs
+    batch_size = args.batch_size
 
     # your data path
     data_Root = os.path.normpath('')
@@ -402,7 +404,7 @@ def main():
     # https://wiki.cancerimagingarchive.net/display/Public/Pancreas-CT#22514040622363b40c0a4da9bf1c2c728d90d54f
     
     json_Path = os.path.normpath('mm_ssl_train.json')
-    logdir_path = os.path.normpath(sv_str+'/mmtestwithMR_'+str(cls_w)+'_'+str(patch_w)+'_'+str(rec_w)+'_'+str(max_epochs)+'_'+str(batch_size))
+    logdir_path = os.path.normpath(sv_str+'/mm_singleGPUparamsweep_'+'_'+str(max_epochs)+'_'+str(batch_size)+'_'+str(args.base_lr))
 
     
     
@@ -416,7 +418,7 @@ def main():
     best_val_loss = 1000.0
 
     chunk_num=2
-    lr = 0.00005*batch_size
+    lr = args.base_lr*batch_size
 
     if os.path.exists(logdir_path)==False:
         os.mkdir(logdir_path)

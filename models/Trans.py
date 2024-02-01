@@ -1,6 +1,4 @@
-
-
-
+import sys
 from functools import partial
 from typing import Tuple, Union
 import torch
@@ -2227,12 +2225,11 @@ class Trans_Unetr(nn.Module):
         mlp_dim: int = 3072,
         num_heads: int = 12,
         pos_embed: str = "perceptron",
-        norm_name: Union[Tuple, str] = "batch",
+        norm_name: Union[Tuple, str] = "instance",
         conv_block: bool = False,
         res_block: bool = True,
         spatial_dims: int = 3,
         in_channels: int=1,
-        #out_channels: int,
     ) -> None:
        
         super().__init__()
@@ -2367,6 +2364,7 @@ class Trans_Unetr(nn.Module):
             spatial_dims=spatial_dims, in_channels=feature_size, out_channels=out_channels
         )  # type: ignore
 
+
     def proj_feat(self, x, hidden_size, feat_size):
         x = x.view(x.size(0), feat_size[0], feat_size[1], feat_size[2], hidden_size)
         x = x.permute(0, 4, 1, 2, 3).contiguous()
@@ -2406,4 +2404,686 @@ class Trans_Unetr(nn.Module):
 
 
         return logits
+
+
+class Trans_Unetr_student(nn.Module):
+    def __init__(
+            self,
+            config,
+            out_channels: int,
+            feature_size: int = 48,
+            hidden_size: int = 768,
+            mlp_dim: int = 3072,
+            num_heads: int = 12,
+            pos_embed: str = "perceptron",
+            norm_name: Union[Tuple, str] = "instance",
+            conv_block: bool = False,
+            res_block: bool = True,
+            spatial_dims: int = 3,
+            in_channels: int = 1,
+            ibot_head_share: bool = False
+            # out_channels: int,
+    ) -> None:
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.feat_size = (config.img_size[0] // 32, config.img_size[1] // 32, config.img_size[2] // 32)
+        if_convskip = config.if_convskip
+        self.if_convskip = if_convskip
+        if_transskip = config.if_transskip
+        self.if_transskip = if_transskip
+        embed_dim = config.embed_dim
+        self.transformer = SwinTransformer_Unetr_Mask_In_Seperate(patch_size=config.patch_size,
+                                           in_chans=config.in_chans,
+                                           embed_dim=config.embed_dim,
+                                           depths=config.depths,
+                                           num_heads=config.num_heads,
+                                           window_size=config.window_size,
+                                           mlp_ratio=config.mlp_ratio,
+                                           qkv_bias=config.qkv_bias,
+                                           drop_rate=config.drop_rate,
+                                           drop_path_rate=config.drop_path_rate,
+                                           ape=config.ape,
+                                           spe=config.spe,
+                                           patch_norm=config.patch_norm,
+                                           use_checkpoint=config.use_checkpoint,
+                                           out_indices=config.out_indices,
+                                           pat_merg_rf=config.pat_merg_rf,
+                                           )
+
+        self.head=head.iBOTHead_w_Cls_Token(
+            384,
+            8192,
+            patch_out_dim=8192,
+            norm=None,
+            act='gelu',
+            norm_last_layer='True',
+            shared_head=ibot_head_share,#'True',
+        )
+        cls_norm=partial(nn.LayerNorm, eps=1e-6)
+
+        self.norm = cls_norm(384)
+        self.avgpool = nn.AdaptiveAvgPool1d(1)
+
+        self.encoder10 = UnetrBasicBlock(
+            spatial_dims=spatial_dims,
+            in_channels=16 * feature_size,
+            out_channels=16 * feature_size,
+            kernel_size=3,
+            stride=1,
+            norm_name=norm_name,
+            res_block=True,
+        )
+
+        self.decoder5 = UnetrUpBlock(
+            spatial_dims=spatial_dims,
+            in_channels=16 * feature_size,
+            out_channels=8 * feature_size,
+            kernel_size=3,
+            upsample_kernel_size=2,
+            norm_name=norm_name,
+            res_block=True,
+        )
+
+        self.decoder4 = UnetrUpBlock(
+            spatial_dims=spatial_dims,
+            in_channels=feature_size * 8,
+            out_channels=feature_size * 4,
+            kernel_size=3,
+            upsample_kernel_size=2,
+            norm_name=norm_name,
+            res_block=True,
+        )
+
+        self.decoder3 = UnetrUpBlock(
+            spatial_dims=spatial_dims,
+            in_channels=feature_size * 4,
+            out_channels=feature_size * 2,
+            kernel_size=3,
+            upsample_kernel_size=2,
+            norm_name=norm_name,
+            res_block=True,
+        )
+        self.decoder2 = UnetrUpBlock(
+            spatial_dims=spatial_dims,
+            in_channels=feature_size * 2,
+            out_channels=feature_size,
+            kernel_size=3,
+            upsample_kernel_size=2,
+            norm_name=norm_name,
+            res_block=True,
+        )
+
+        self.decoder1 = nn.Sequential(get_conv_layer(
+            spatial_dims,
+            feature_size,
+            feature_size,
+            kernel_size=2,
+            stride=2,
+            conv_only=True,
+            is_transposed=True,
+        ),
+            UnetBasicBlock(  # type: ignore
+            spatial_dims,
+            feature_size,
+            feature_size,
+            kernel_size=3,
+            stride=1,
+            norm_name=norm_name,
+        )
+        )
+
+        self.out = UnetOutBlock(
+            spatial_dims=spatial_dims, in_channels=feature_size, out_channels=out_channels
+        )  # type: ignore
+
+    def proj_feat(self, x, hidden_size, feat_size):
+        x = x.view(x.size(0), feat_size[0], feat_size[1], feat_size[2], hidden_size)
+        x = x.permute(0, 4, 1, 2, 3).contiguous()
+        return x
+
+    def forward(self, x_in,mask):
+
+        x, x_feature, out_feats = self.transformer(x_in, mask)
+        x_region = self.norm(x_feature)  # B L C
+
+        # print ('after all transformer x size is ',x_region.size())
+        x_cls = self.avgpool(x_region.transpose(1, 2))  # B C 1
+        # print ('after avgpool x size is ',x.size())
+        x_cls = torch.flatten(x_cls, 1)
+        # print ('x size',x.shape)
+        # print ('x_region size',x_region.shape)
+        x_region_all = torch.cat([x_cls.unsqueeze(1), x_region], dim=1)
+
+        x_token = self.head(x_region_all)
+
+        enc44 = out_feats[-1]  # torch.Size([4, 384, 8, 8, 8])
+        enc33 = out_feats[-2]  # torch.Size([4, 192, 16, 16, 16])
+        enc22 = out_feats[-3]  # torch.Size([4, 96, 32, 32, 32])
+        enc11 = out_feats[-4]  # torch.Size([4, 48, 64, 64, 64])
+        x = self.proj_feat(x, self.hidden_size, self.feat_size)  # torch.Size([4, 768, 4, 4, 4])
+
+
+        dec4 = self.encoder10(x)
+
+        dec3 = self.decoder5(dec4, enc44)
+        dec2 = self.decoder4(dec3, enc33)
+        dec1 = self.decoder3(dec2, enc22)
+        dec0 = self.decoder2(dec1, enc11)
+        out = self.decoder1(dec0)
+        x_rec = self.out(out)
+
+        return x_token, x_rec
+
+class Trans_Unetr_teacher(nn.Module):
+    def __init__(
+            self,
+            config,
+            out_channels: int,
+            feature_size: int = 48,
+            hidden_size: int = 768,
+            mlp_dim: int = 3072,
+            num_heads: int = 12,
+            pos_embed: str = "perceptron",
+            norm_name: Union[Tuple, str] = "instance",
+            conv_block: bool = False,
+            res_block: bool = True,
+            spatial_dims: int = 3,
+            in_channels: int = 1,
+            ibot_head_share: bool = False
+            # out_channels: int,
+    ) -> None:
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.feat_size = (config.img_size[0] // 32, config.img_size[1] // 32, config.img_size[2] // 32)
+        if_convskip = config.if_convskip
+        self.if_convskip = if_convskip
+        if_transskip = config.if_transskip
+        self.if_transskip = if_transskip
+        embed_dim = config.embed_dim
+        self.transformer = SwinTransformer_Unetr_Seperate(patch_size=config.patch_size,
+                                           in_chans=config.in_chans,
+                                           embed_dim=config.embed_dim,
+                                           depths=config.depths,
+                                           num_heads=config.num_heads,
+                                           window_size=config.window_size,
+                                           mlp_ratio=config.mlp_ratio,
+                                           qkv_bias=config.qkv_bias,
+                                           drop_rate=config.drop_rate,
+                                           drop_path_rate=config.drop_path_rate,
+                                           ape=config.ape,
+                                           spe=config.spe,
+                                           patch_norm=config.patch_norm,
+                                           use_checkpoint=config.use_checkpoint,
+                                           out_indices=config.out_indices,
+                                           pat_merg_rf=config.pat_merg_rf,
+                                           )
+
+        self.head=head.iBOTHead_w_Cls_Token(
+            384,
+            8192,
+            patch_out_dim=8192,
+            norm=None,
+            act='gelu',
+            norm_last_layer='True',
+            shared_head=ibot_head_share,#'True',
+        )
+        cls_norm=partial(nn.LayerNorm, eps=1e-6)
+
+        self.norm = cls_norm(384)
+        self.avgpool = nn.AdaptiveAvgPool1d(1)
+
+        self.encoder10 = UnetrBasicBlock(
+            spatial_dims=spatial_dims,
+            in_channels=16 * feature_size,
+            out_channels=16 * feature_size,
+            kernel_size=3,
+            stride=1,
+            norm_name=norm_name,
+            res_block=True,
+        )
+
+        self.decoder5 = UnetrUpBlock(
+            spatial_dims=spatial_dims,
+            in_channels=16 * feature_size,
+            out_channels=8 * feature_size,
+            kernel_size=3,
+            upsample_kernel_size=2,
+            norm_name=norm_name,
+            res_block=True,
+        )
+
+        self.decoder4 = UnetrUpBlock(
+            spatial_dims=spatial_dims,
+            in_channels=feature_size * 8,
+            out_channels=feature_size * 4,
+            kernel_size=3,
+            upsample_kernel_size=2,
+            norm_name=norm_name,
+            res_block=True,
+        )
+
+        self.decoder3 = UnetrUpBlock(
+            spatial_dims=spatial_dims,
+            in_channels=feature_size * 4,
+            out_channels=feature_size * 2,
+            kernel_size=3,
+            upsample_kernel_size=2,
+            norm_name=norm_name,
+            res_block=True,
+        )
+        self.decoder2 = UnetrUpBlock(
+            spatial_dims=spatial_dims,
+            in_channels=feature_size * 2,
+            out_channels=feature_size,
+            kernel_size=3,
+            upsample_kernel_size=2,
+            norm_name=norm_name,
+            res_block=True,
+        )
+
+        self.decoder1 = nn.Sequential(get_conv_layer(
+            spatial_dims,
+            feature_size,
+            feature_size,
+            kernel_size=2,
+            stride=2,
+            conv_only=True,
+            is_transposed=True,
+        ),
+            UnetBasicBlock(  # type: ignore
+            spatial_dims,
+            feature_size,
+            feature_size,
+            kernel_size=3,
+            stride=1,
+            norm_name=norm_name,
+        )
+        )
+
+        self.out = UnetOutBlock(
+            spatial_dims=spatial_dims, in_channels=feature_size, out_channels=out_channels
+        )  # type: ignore
+
+    def proj_feat(self, x, hidden_size, feat_size):
+        x = x.view(x.size(0), feat_size[0], feat_size[1], feat_size[2], hidden_size)
+        x = x.permute(0, 4, 1, 2, 3).contiguous()
+        return x
+
+    def forward(self, x_in):
+
+        x, x_feature, out_feats = self.transformer(x_in)
+        x_region = self.norm(x_feature)  # B L C
+
+        # print ('after all transformer x size is ',x_region.size())
+        x_cls = self.avgpool(x_region.transpose(1, 2))  # B C 1
+        # print ('after avgpool x size is ',x.size())
+        x_cls = torch.flatten(x_cls, 1)
+        # print ('x size',x.shape)
+        # print ('x_region size',x_region.shape)
+        x_region_all = torch.cat([x_cls.unsqueeze(1), x_region], dim=1)
+
+        x_token = self.head(x_region_all)
+
+        return x_token
+
+
+class Trans_Unetr_multilevelrec_student(nn.Module):
+    def __init__(
+            self,
+            config,
+            out_channels: int,
+            feature_size: int = 48,
+            hidden_size: int = 768,
+            mlp_dim: int = 3072,
+            num_heads: int = 12,
+            pos_embed: str = "perceptron",
+            norm_name: Union[Tuple, str] = "instance",
+            conv_block: bool = False,
+            res_block: bool = True,
+            spatial_dims: int = 3,
+            in_channels: int = 1,
+            ibot_head_share: bool = False
+            # out_channels: int,
+    ) -> None:
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.feat_size = (config.img_size[0] // 32, config.img_size[1] // 32, config.img_size[2] // 32)
+        if_convskip = config.if_convskip
+        self.if_convskip = if_convskip
+        if_transskip = config.if_transskip
+        self.if_transskip = if_transskip
+        embed_dim = config.embed_dim
+        self.transformer = SwinTransformer_Unetr_Mask_In_Seperate(patch_size=config.patch_size,
+                                                                  in_chans=config.in_chans,
+                                                                  embed_dim=config.embed_dim,
+                                                                  depths=config.depths,
+                                                                  num_heads=config.num_heads,
+                                                                  window_size=config.window_size,
+                                                                  mlp_ratio=config.mlp_ratio,
+                                                                  qkv_bias=config.qkv_bias,
+                                                                  drop_rate=config.drop_rate,
+                                                                  drop_path_rate=config.drop_path_rate,
+                                                                  ape=config.ape,
+                                                                  spe=config.spe,
+                                                                  patch_norm=config.patch_norm,
+                                                                  use_checkpoint=config.use_checkpoint,
+                                                                  out_indices=config.out_indices,
+                                                                  pat_merg_rf=config.pat_merg_rf,
+                                                                  )
+
+        self.head=head.iBOTHead_w_Cls_Token(
+            384,
+            8192,
+            patch_out_dim=8192,
+            norm=None,
+            act='gelu',
+            norm_last_layer='True',
+            shared_head=ibot_head_share,#'True',
+        )
+        cls_norm=partial(nn.LayerNorm, eps=1e-6)
+
+        self.norm = cls_norm(384)
+        self.avgpool = nn.AdaptiveAvgPool1d(1)
+
+        #rewrite above with self. attributes
+        self.out_channels = out_channels
+        self.all_logits = []
+        self.logits_in_list = [feature_size*4, feature_size*2, feature_size]
+        for inc in self.logits_in_list:
+            self.all_logits.append(Logits(in_channels=inc,
+                                          out_channels=self.out_channels,
+                                          is_2d=False,
+                                          p_dropout=0.9))
+
+        self.all_logits = nn.ModuleList(self.all_logits)
+
+        self.encoder10 = UnetrBasicBlock(
+            spatial_dims=spatial_dims,
+            in_channels=16 * feature_size,
+            out_channels=16 * feature_size,
+            kernel_size=3,
+            stride=1,
+            norm_name=norm_name,
+            res_block=True,
+        )
+
+        self.decoder5 = UnetrUpBlock(
+            spatial_dims=spatial_dims,
+            in_channels=16 * feature_size,
+            out_channels=8 * feature_size,
+            kernel_size=3,
+            upsample_kernel_size=2,
+            norm_name=norm_name,
+            res_block=True,
+        )
+
+        self.decoder4 = UnetrUpBlock(
+            spatial_dims=spatial_dims,
+            in_channels=feature_size * 8,
+            out_channels=feature_size * 4,
+            kernel_size=3,
+            upsample_kernel_size=2,
+            norm_name=norm_name,
+            res_block=True,
+        )
+
+        self.decoder3 = UnetrUpBlock(
+            spatial_dims=spatial_dims,
+            in_channels=feature_size * 4,
+            out_channels=feature_size * 2,
+            kernel_size=3,
+            upsample_kernel_size=2,
+            norm_name=norm_name,
+            res_block=True,
+        )
+        self.decoder2 = UnetrUpBlock(
+            spatial_dims=spatial_dims,
+            in_channels=feature_size * 2,
+            out_channels=feature_size,
+            kernel_size=3,
+            upsample_kernel_size=2,
+            norm_name=norm_name,
+            res_block=True,
+        )
+
+        self.decoder1 = nn.Sequential(get_conv_layer(
+            spatial_dims,
+            feature_size,
+            feature_size,
+            kernel_size=2,
+            stride=2,
+            conv_only=True,
+            is_transposed=True,
+        ),
+            UnetBasicBlock(  # type: ignore
+            spatial_dims,
+            feature_size,
+            feature_size,
+            kernel_size=3,
+            stride=1,
+            norm_name=norm_name,
+        )
+        )
+
+        self.out = UnetOutBlock(
+            spatial_dims=spatial_dims, in_channels=feature_size, out_channels=out_channels
+        )  # type: ignore
+
+    def proj_feat(self, x, hidden_size, feat_size):
+        x = x.view(x.size(0), feat_size[0], feat_size[1], feat_size[2], hidden_size)
+        x = x.permute(0, 4, 1, 2, 3).contiguous()
+        return x
+
+    def forward(self, x_in,mask):
+        x, x_feature, out_feats = self.transformer(x_in, mask)
+        x_region = self.norm(x_feature)  # B L C
+
+        # print ('after all transformer x size is ',x_region.size())
+        x_cls = self.avgpool(x_region.transpose(1, 2))  # B C 1
+        # print ('after avgpool x size is ',x.size())
+        x_cls = torch.flatten(x_cls, 1)
+        # print ('x size',x.shape)
+        # print ('x_region size',x_region.shape)
+        x_region_all = torch.cat([x_cls.unsqueeze(1), x_region], dim=1)
+
+        x_token = self.head(x_region_all)
+        logs = []
+
+        enc44 = out_feats[-1]  # torch.Size([4, 384, 8, 8, 8])
+        enc33 = out_feats[-2]  # torch.Size([4, 192, 16, 16, 16])
+        enc22 = out_feats[-3]  # torch.Size([4, 96, 32, 32, 32])
+        enc11 = out_feats[-4]  # torch.Size([4, 48, 64, 64, 64])
+        x = self.proj_feat(x, self.hidden_size, self.feat_size)  # torch.Size([4, 768, 4, 4, 4])
+
+        dec4 = self.encoder10(x)
+
+        dec3 = self.decoder5(dec4, enc44)
+        dec2 = self.decoder4(dec3, enc33)
+        logs.append(self.all_logits[0](dec2))
+        dec1 = self.decoder3(dec2, enc22)
+        logs.append(self.all_logits[1](dec1))
+        dec0 = self.decoder2(dec1, enc11)
+        logs.append(self.all_logits[2](dec0))
+        out = self.decoder1(dec0)
+        logits = self.out(out)
+        logs.append(logits)
+
+        return x_token, logs[::-1]
+
+class Trans_Unetr_multilevelrec_teacher(nn.Module):
+    def __init__(
+            self,
+            config,
+            out_channels: int,
+            feature_size: int = 48,
+            hidden_size: int = 768,
+            mlp_dim: int = 3072,
+            num_heads: int = 12,
+            pos_embed: str = "perceptron",
+            norm_name: Union[Tuple, str] = "instance",
+            conv_block: bool = False,
+            res_block: bool = True,
+            spatial_dims: int = 3,
+            in_channels: int = 1,
+            ibot_head_share: bool = False
+            # out_channels: int,
+    ) -> None:
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.feat_size = (config.img_size[0] // 32, config.img_size[1] // 32, config.img_size[2] // 32)
+        if_convskip = config.if_convskip
+        self.if_convskip = if_convskip
+        if_transskip = config.if_transskip
+        self.if_transskip = if_transskip
+        embed_dim = config.embed_dim
+        self.transformer = SwinTransformer_Unetr_Seperate(patch_size=config.patch_size,
+                                                                  in_chans=config.in_chans,
+                                                                  embed_dim=config.embed_dim,
+                                                                  depths=config.depths,
+                                                                  num_heads=config.num_heads,
+                                                                  window_size=config.window_size,
+                                                                  mlp_ratio=config.mlp_ratio,
+                                                                  qkv_bias=config.qkv_bias,
+                                                                  drop_rate=config.drop_rate,
+                                                                  drop_path_rate=config.drop_path_rate,
+                                                                  ape=config.ape,
+                                                                  spe=config.spe,
+                                                                  patch_norm=config.patch_norm,
+                                                                  use_checkpoint=config.use_checkpoint,
+                                                                  out_indices=config.out_indices,
+                                                                  pat_merg_rf=config.pat_merg_rf,
+                                                                  )
+        self.head=head.iBOTHead_w_Cls_Token(
+            384,
+            8192,
+            patch_out_dim=8192,
+            norm=None,
+            act='gelu',
+            norm_last_layer='True',
+            shared_head=ibot_head_share,#'True',
+        )
+        cls_norm=partial(nn.LayerNorm, eps=1e-6)
+
+        self.norm = cls_norm(384)
+        self.avgpool = nn.AdaptiveAvgPool1d(1)
+        #rewrite above with self. attributes
+        self.out_channels = out_channels
+        self.all_logits = []
+        self.logits_in_list = [feature_size*2, feature_size, feature_size]
+        for inc in self.logits_in_list:
+            self.all_logits.append(Logits(in_channels=inc,
+                                          out_channels=self.out_channels,
+                                          is_2d=False,
+                                          p_dropout=0.9))
+
+
+        self.encoder10 = UnetrBasicBlock(
+            spatial_dims=spatial_dims,
+            in_channels=16 * feature_size,
+            out_channels=16 * feature_size,
+            kernel_size=3,
+            stride=1,
+            norm_name=norm_name,
+            res_block=True,
+        )
+
+        self.decoder5 = UnetrUpBlock(
+            spatial_dims=spatial_dims,
+            in_channels=16 * feature_size,
+            out_channels=8 * feature_size,
+            kernel_size=3,
+            upsample_kernel_size=2,
+            norm_name=norm_name,
+            res_block=True,
+        )
+
+        self.decoder4 = UnetrUpBlock(
+            spatial_dims=spatial_dims,
+            in_channels=feature_size * 8,
+            out_channels=feature_size * 4,
+            kernel_size=3,
+            upsample_kernel_size=2,
+            norm_name=norm_name,
+            res_block=True,
+        )
+
+        self.decoder3 = UnetrUpBlock(
+            spatial_dims=spatial_dims,
+            in_channels=feature_size * 4,
+            out_channels=feature_size * 2,
+            kernel_size=3,
+            upsample_kernel_size=2,
+            norm_name=norm_name,
+            res_block=True,
+        )
+        self.decoder2 = UnetrUpBlock(
+            spatial_dims=spatial_dims,
+            in_channels=feature_size * 2,
+            out_channels=feature_size,
+            kernel_size=3,
+            upsample_kernel_size=2,
+            norm_name=norm_name,
+            res_block=True,
+        )
+
+        self.decoder1 = nn.Sequential(get_conv_layer(
+            spatial_dims,
+            feature_size,
+            feature_size,
+            kernel_size=2,
+            stride=2,
+            conv_only=True,
+            is_transposed=True,
+        ),
+            UnetBasicBlock(
+            spatial_dims,
+            feature_size,
+            feature_size,
+            kernel_size=3,
+            stride=1,
+            norm_name=norm_name,
+        )
+        )
+
+        self.out = UnetOutBlock(
+            spatial_dims=spatial_dims, in_channels=feature_size, out_channels=out_channels
+        )  # type: ignore
+
+    def proj_feat(self, x, hidden_size, feat_size):
+        x = x.view(x.size(0), feat_size[0], feat_size[1], feat_size[2], hidden_size)
+        x = x.permute(0, 4, 1, 2, 3).contiguous()
+        return x
+
+    def forward(self, x_in):
+        x, x_feature, out_feats = self.transformer(x_in)
+        x_region = self.norm(x_feature)  # B L C
+
+        # print ('after all transformer x size is ',x_region.size())
+        x_cls = self.avgpool(x_region.transpose(1, 2))  # B C 1
+        # print ('after avgpool x size is ',x.size())
+        x_cls = torch.flatten(x_cls, 1)
+        # print ('x size',x.shape)
+        # print ('x_region size',x_region.shape)
+        x_region_all = torch.cat([x_cls.unsqueeze(1), x_region], dim=1)
+
+        x_token = self.head(x_region_all)
+
+        return x_token
+
+class Logits(nn.Module):
+
+    def __init__(self, in_channels, out_channels, is_2d, p_dropout=0):
+        super().__init__()
+        if is_2d:
+            self.logits = nn.Conv2d(in_channels, out_channels, 1, bias=False)
+            self.dropout = nn.Dropout2d(p_dropout, inplace=True)
+        else:
+            self.logits = nn.Conv3d(in_channels, out_channels, 1, bias=False)
+            self.dropout = nn.Dropout3d(p_dropout, inplace=True)
+        nn.init.kaiming_normal_(self.logits.weight)
+
+    def forward(self, xb):
+        return self.dropout(self.logits(xb))
+
+
 
