@@ -16,7 +16,7 @@ import logging
 import dicom2nifti.common as common
 import dicom2nifti.convert_dicom as convert_dicom
 import dicom2nifti.settings
-
+import torch
 logger = logging.getLogger(__name__)
 
 
@@ -159,7 +159,7 @@ if __name__ == '__main__':
     CT_dir = os.path.join(MM_home, 'CT')
 
     for mode_path in [MR_dir,CT_dir]:
-        m_im_p = os.path.join(mode_path, 'images')
+        m_im_p = os.path.join(mode_path, 'images_alt')
         if not os.path.exists(m_im_p): os.makedirs(m_im_p)
 
         for dataset in [dir for dir in os.listdir(mode_path) if (os.path.isdir(os.path.join(mode_path,dir))) and (dir!='images')]:
@@ -168,5 +168,25 @@ if __name__ == '__main__':
                 print(dataset)
                 print(series)
                 s_im_p = os.path.join(m_im_p, dataset+'#'+series+'.nii.gz')
-                convert_directory(os.path.join(mode_path, dataset, series), s_im_p, compression=True,
+                try:
+                    convert_directory(os.path.join(mode_path, dataset, series), s_im_p, compression=True,
                                               reorient=True)
+                except:
+                    print('Failed to convert directory')
+                    continue
+
+                nibim = nib.load(s_im_p)
+                im = nibim.get_fdata()
+                #if 4d, take first volume. find the channel-wise dim using argmin
+                if len(im.shape) == 4:
+                    print('4d image',dataset,series)
+                    im = torch.Tensor(im).select(torch.argmin(torch.Tensor(list(im.shape))), 0)
+                    affine = nibim.affine
+                    # check affine is 4x4
+                    assert affine.shape == (4, 4)
+                    new_nibim = nib.Nifti1Image(im.numpy(), affine)
+                    nib.save(new_nibim, s_im_p)
+                elif len(im.shape) == 3:
+                    continue
+                else:
+                    raise ValueError('Image shape is not 3d or 4d')
