@@ -821,3 +821,4 @@ if __name__ == '__main__':
                                              n_im_channels=1)
 
     preprocess.preprocess_raw_data('bask/projects/p/phwq4930-renal-canc/data/SSL_Data/CT')
+    preprocess.preprocess_raw_data('bask/projects/p/phwq4930-renal-canc/data/SSL_Data/DeepLesion')
