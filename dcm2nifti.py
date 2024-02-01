@@ -158,13 +158,8 @@ if __name__ == '__main__':
     MR_dir = os.path.join(MM_home, 'MR')
     CT_dir = os.path.join(MM_home, 'CT')
 
-<<<<<<< HEAD
-    for mode_path in [MR_dir,CT_dir]:
-        m_im_p = os.path.join(mode_path, 'images_alt')
-=======
     for mode_path in [CT_dir,MR_dir]:
         m_im_p = os.path.join(mode_path, 'images')
->>>>>>> f8740bd (update HPc)
         if not os.path.exists(m_im_p): os.makedirs(m_im_p)
 
         for dataset in [dir for dir in os.listdir(mode_path) if (os.path.isdir(os.path.join(mode_path,dir))) and (dir!='images')]:
